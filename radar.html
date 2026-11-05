@@ -44,7 +44,7 @@ video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
   <div class="big">Echo</div>
   <div class="tag">see with your ears</div>
   <div class="btn" id="startText">Start</div>
-  <div class="hint">Wear headphones · hold the phone at chest height, camera forward</div>
+  <div class="hint">Left ear “tok” · Right ear “ting” · Ahead “bzz” — faster = closer<br>Wear headphones · phone at chest height, camera forward</div>
 </button>
 
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
@@ -62,7 +62,7 @@ const DETECT_MS = 120;
 // ---------- elements ----------
 const $ = id => document.getElementById(id);
 const video = $('video'), canvas = $('canvas'), g = canvas.getContext('2d');
-let model, modelPromise, ctx, panner, running = false, muted = false;
+let model, modelPromise, ctx, running = false, muted = false;
 let target = null, lastSeen = 0, lastDetect = 0, preds = [];
 let lastSpeak = 0, lastKey = '', wakeLock = null;
 
@@ -75,11 +75,6 @@ $('start').addEventListener('click', async () => {
     // audio must be unlocked inside the tap on iOS
     ctx = new (window.AudioContext || window.webkitAudioContext)();
     await ctx.resume();
-    panner = ctx.createPanner();
-    panner.panningModel = 'HRTF';
-    panner.distanceModel = 'linear';
-    setPan(0);
-    panner.connect(ctx.destination);
     say('Echo on');
 
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -137,7 +132,7 @@ function pickTarget(now) {
       best.c = target.c * 0.55 + best.c * 0.45;
       best.cx = target.cx * 0.55 + best.cx * 0.45;
     }
-    target = best; lastSeen = now;
+    target = best; target.side = stableSide(best.cx); lastSeen = now;
   } else if (now - lastSeen > 600) {
     target = null;
   }
@@ -146,46 +141,69 @@ function pickTarget(now) {
 }
 
 // ---------- sound ----------
-function setPan(cx) {
-  const x = cx * 3, z = -1;
-  if (panner.positionX) {
-    panner.positionX.setValueAtTime(x, ctx.currentTime);
-    panner.positionY.setValueAtTime(0, ctx.currentTime);
-    panner.positionZ.setValueAtTime(z, ctx.currentTime);
-  } else panner.setPosition(x, 0, z);
-}
+// Each side has its own timbre AND its own ear, so direction is obvious:
+//   left  = low wooden "tok"  — left ear only
+//   right = high bell "ting"  — right ear only
+//   ahead = buzzy "bzz"       — both ears (most urgent)
+// Distance is carried only by speed (closer = faster), never by pitch.
+const VOICES = {
+  left:  { type: 'triangle', freq: 440,  len: 0.06, peak: 0.9,  pan: -1 },
+  right: { type: 'sine',     freq: 1480, len: 0.22, peak: 0.6,  pan: 1 },
+  ahead: { type: 'sawtooth', freq: 220,  len: 0.12, peak: 0.35, pan: 0 }
+};
 
-function beep(c, cx) {
-  setPan(cx);
-  const t = ctx.currentTime, o = ctx.createOscillator(), v = ctx.createGain();
-  o.type = 'sine';
-  o.frequency.value = 560 + c * 760;                      // closer = higher
-  v.gain.setValueAtTime(0, t);
-  v.gain.linearRampToValueAtTime(0.7, t + 0.01);
-  v.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
-  o.connect(v).connect(panner);
-  o.start(t); o.stop(t + 0.1);
+function beep(where) {
+  const v = VOICES[where], t = ctx.currentTime;
+  const o = ctx.createOscillator(), amp = ctx.createGain();
+  o.type = v.type;
+  o.frequency.value = v.freq;
+  amp.gain.setValueAtTime(0, t);
+  amp.gain.linearRampToValueAtTime(v.peak, t + 0.004);
+  amp.gain.exponentialRampToValueAtTime(0.001, t + v.len);
+  o.connect(amp);
+  if (ctx.createStereoPanner) {
+    const p = ctx.createStereoPanner();
+    p.pan.value = v.pan;
+    amp.connect(p).connect(ctx.destination);
+  } else amp.connect(ctx.destination);
+  o.start(t); o.stop(t + v.len + 0.02);
+  if (where === 'right') {                                // bell overtone makes "ting" unmistakable
+    const o2 = ctx.createOscillator(), a2 = ctx.createGain(), p2 = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+    o2.type = 'sine'; o2.frequency.value = v.freq * 2.76;
+    a2.gain.setValueAtTime(0, t); a2.gain.linearRampToValueAtTime(0.2, t + 0.004); a2.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    o2.connect(a2);
+    if (p2) { p2.pan.value = 1; a2.connect(p2).connect(ctx.destination); } else a2.connect(ctx.destination);
+    o2.start(t); o2.stop(t + 0.14);
+  }
 }
 
 function tick() {
   if (!running) return;
   let wait = 300;
   if (!muted && target && target.c >= BEEP_FROM) {
-    beep(target.c, target.cx);
+    beep(target.side);
     wait = 1000 - ((Math.min(target.c, 1) - BEEP_FROM) / (1 - BEEP_FROM)) * 880;  // 1000ms → 120ms
   }
   setTimeout(tick, wait);
 }
 
-function side(cx) { return cx < -0.33 ? 'left' : cx > 0.33 ? 'right' : 'ahead'; }
+// side with hysteresis so the sound doesn't flicker between ears at the border
+let curSide = 'ahead';
+function stableSide(cx) {
+  const T = 0.33, M = 0.08;
+  if (curSide === 'left')       { if (cx > -T + M) curSide = cx > T + M ? 'right' : 'ahead'; }
+  else if (curSide === 'right') { if (cx <  T - M) curSide = cx < -T - M ? 'left' : 'ahead'; }
+  else                          { if (cx < -T - M) curSide = 'left'; else if (cx > T + M) curSide = 'right'; }
+  return curSide;
+}
 function nice(cls) { return NAMES[cls] || cls; }
 
 function maybeSpeak() {
   if (muted || !target || target.c < SPEAK_FROM) return;
-  const now = Date.now(), key = target.cls + side(target.cx);
+  const now = Date.now(), key = target.cls + target.side;
   if (now - lastSpeak < 1800) return;
   if (key !== lastKey || now - lastSpeak > 5000) {
-    say(`${nice(target.cls)}, ${side(target.cx)}, close`);
+    say(`${nice(target.cls)}, ${target.side}, close`);
     lastSpeak = now; lastKey = key;
   }
 }
@@ -209,7 +227,7 @@ function updateHud() {
   }
   const near = target.c >= SPEAK_FROM;
   $('label').textContent = nice(target.cls).toUpperCase();
-  $('sub').textContent = `${side(target.cx).toUpperCase()} · ${near ? 'CLOSE' : 'NEAR'}`;
+  $('sub').textContent = `${target.side.toUpperCase()} · ${near ? 'CLOSE' : 'NEAR'}`;
   $('bar').style.width = (target.c * 100) + '%';
   $('bar').style.background = near ? 'var(--red)' : 'var(--amber)';
 }
