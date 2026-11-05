@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Echo · Sound Radar</title>
+<style>
+:root{--bg:#0b0d10;--fg:#f4f4f4;--dim:#8a9099;--amber:#ffb020;--red:#ff4d4d}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--fg);font-family:-apple-system,system-ui,sans-serif;overflow:hidden;-webkit-user-select:none;user-select:none}
+#stage{position:fixed;inset:0}
+video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#top{position:absolute;top:0;left:0;right:0;padding:calc(12px + env(safe-area-inset-top)) 18px 24px;display:flex;justify-content:space-between;align-items:center;font-size:14px;letter-spacing:.08em;color:var(--dim);background:linear-gradient(rgba(0,0,0,.75),transparent)}
+#top b{color:var(--fg);letter-spacing:.14em}
+#hud{position:absolute;left:0;right:0;bottom:0;padding:40px 20px calc(24px + env(safe-area-inset-bottom));background:linear-gradient(transparent,rgba(0,0,0,.88))}
+#label{font-size:46px;font-weight:800;letter-spacing:-.02em;line-height:1}
+#sub{font-size:18px;color:var(--dim);margin-top:8px;letter-spacing:.06em}
+#meter{height:12px;border-radius:6px;background:#26292e;margin-top:16px;overflow:hidden}
+#bar{height:100%;width:0;background:var(--amber);transition:width .15s,background .15s}
+#paused{position:absolute;inset:0;display:none;align-items:center;justify-content:center;font-size:40px;font-weight:800;background:rgba(0,0,0,.55)}
+#start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;width:100%;background:var(--bg);color:var(--fg);border:0;font:inherit;cursor:pointer}
+#start .big{font-size:68px;font-weight:800;letter-spacing:-.03em}
+#start .tag{font-size:18px;color:var(--dim)}
+#start .btn{margin-top:28px;padding:24px 60px;border-radius:999px;background:var(--amber);color:#111;font-size:26px;font-weight:800}
+#start .hint{position:absolute;bottom:calc(28px + env(safe-area-inset-bottom));font-size:14px;color:var(--dim);text-align:center;padding:0 28px}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="canvas"></canvas>
+  <div id="top"><b>ECHO · SOUND RADAR</b><span id="status">tap to pause</span></div>
+  <div id="hud">
+    <div id="label">—</div>
+    <div id="sub">Path clear</div>
+    <div id="meter"><div id="bar"></div></div>
+  </div>
+  <div id="paused">PAUSED</div>
+</div>
+
+<button id="start" aria-label="Start Echo">
+  <div class="big">Echo</div>
+  <div class="tag">see with your ears</div>
+  <div class="btn" id="startText">Start</div>
+  <div class="hint">Wear headphones · hold the phone at chest height, camera forward</div>
+</button>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+// ---------- settings ----------
+const RELEVANT = new Set(['person','chair','couch','bench','dining table','bicycle','motorcycle','car','bus','truck',
+  'potted plant','bed','toilet','tv','laptop','suitcase','backpack','dog','cat','refrigerator','oven','sink',
+  'fire hydrant','stop sign','umbrella']);
+const NAMES = {'dining table':'table','potted plant':'plant','tv':'screen','fire hydrant':'hydrant','stop sign':'sign'};
+const BEEP_FROM = 0.30;   // closeness where beeping starts
+const SPEAK_FROM = 0.60;  // closeness where it also speaks
+const DETECT_MS = 120;
+
+// ---------- elements ----------
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('canvas'), g = canvas.getContext('2d');
+let model, modelPromise, ctx, panner, running = false, muted = false;
+let target = null, lastSeen = 0, lastDetect = 0, preds = [];
+let lastSpeak = 0, lastKey = '', wakeLock = null;
+
+modelPromise = cocoSsd.load({ base: 'lite_mobilenet_v2' });
+
+// ---------- start ----------
+$('start').addEventListener('click', async () => {
+  $('startText').textContent = 'Loading…';
+  try {
+    // audio must be unlocked inside the tap on iOS
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.resume();
+    panner = ctx.createPanner();
+    panner.panningModel = 'HRTF';
+    panner.distanceModel = 'linear';
+    setPan(0);
+    panner.connect(ctx.destination);
+    say('Echo on');
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    model = await modelPromise;
+
+    $('start').style.display = 'none';
+    running = true;
+    keepAwake();
+    requestAnimationFrame(loop);
+    tick();
+  } catch (e) {
+    $('startText').textContent = 'Camera blocked — retry';
+    console.error(e);
+  }
+});
+
+// tap anywhere = pause / resume (the one user action)
+$('stage').addEventListener('click', () => {
+  muted = !muted;
+  $('paused').style.display = muted ? 'flex' : 'none';
+  say(muted ? 'Paused' : 'Radar on');
+});
+document.addEventListener('keydown', e => { if (e.key === 'm') $('stage').click(); });
+
+// ---------- detection ----------
+async function loop() {
+  if (!running) return;
+  const now = performance.now();
+  if (!muted && now - lastDetect > DETECT_MS && video.readyState >= 2) {
+    lastDetect = now;
+    preds = (await model.detect(video, 10, 0.45)).filter(p => RELEVANT.has(p.class));
+    pickTarget(now);
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function pickTarget(now) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  let best = null;
+  for (const p of preds) {
+    const [x, y, w, h] = p.bbox;
+    const cx = ((x + w / 2) / vw) * 2 - 1;                 // -1 left … +1 right
+    const c = Math.min(1, Math.max(h / vh, Math.sqrt((w * h) / (vw * vh)) * 1.15));
+    const score = c * (1 - 0.35 * Math.abs(cx));            // things straight ahead matter more
+    if (!best || score > best.score) best = { cls: p.class, cx, c, score, bbox: p.bbox };
+  }
+  if (best) {
+    if (target && target.cls === best.cls) {                // smooth so it doesn't jitter
+      best.c = target.c * 0.55 + best.c * 0.45;
+      best.cx = target.cx * 0.55 + best.cx * 0.45;
+    }
+    target = best; lastSeen = now;
+  } else if (now - lastSeen > 600) {
+    target = null;
+  }
+  updateHud();
+  maybeSpeak();
+}
+
+// ---------- sound ----------
+function setPan(cx) {
+  const x = cx * 3, z = -1;
+  if (panner.positionX) {
+    panner.positionX.setValueAtTime(x, ctx.currentTime);
+    panner.positionY.setValueAtTime(0, ctx.currentTime);
+    panner.positionZ.setValueAtTime(z, ctx.currentTime);
+  } else panner.setPosition(x, 0, z);
+}
+
+function beep(c, cx) {
+  setPan(cx);
+  const t = ctx.currentTime, o = ctx.createOscillator(), v = ctx.createGain();
+  o.type = 'sine';
+  o.frequency.value = 560 + c * 760;                      // closer = higher
+  v.gain.setValueAtTime(0, t);
+  v.gain.linearRampToValueAtTime(0.7, t + 0.01);
+  v.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+  o.connect(v).connect(panner);
+  o.start(t); o.stop(t + 0.1);
+}
+
+function tick() {
+  if (!running) return;
+  let wait = 300;
+  if (!muted && target && target.c >= BEEP_FROM) {
+    beep(target.c, target.cx);
+    wait = 1000 - ((Math.min(target.c, 1) - BEEP_FROM) / (1 - BEEP_FROM)) * 880;  // 1000ms → 120ms
+  }
+  setTimeout(tick, wait);
+}
+
+function side(cx) { return cx < -0.33 ? 'left' : cx > 0.33 ? 'right' : 'ahead'; }
+function nice(cls) { return NAMES[cls] || cls; }
+
+function maybeSpeak() {
+  if (muted || !target || target.c < SPEAK_FROM) return;
+  const now = Date.now(), key = target.cls + side(target.cx);
+  if (now - lastSpeak < 1800) return;
+  if (key !== lastKey || now - lastSpeak > 5000) {
+    say(`${nice(target.cls)}, ${side(target.cx)}, close`);
+    lastSpeak = now; lastKey = key;
+  }
+}
+
+function say(text) {
+  if (!('speechSynthesis' in window)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.1; u.lang = 'en-US';
+  speechSynthesis.speak(u);
+}
+
+// ---------- screen (for sighted viewers / recording) ----------
+function updateHud() {
+  if (!target || target.c < BEEP_FROM) {
+    $('label').textContent = target ? nice(target.cls).toUpperCase() : '—';
+    $('sub').textContent = 'Path clear';
+    $('bar').style.width = target ? (target.c * 100) + '%' : '0';
+    $('bar').style.background = 'var(--dim)';
+    return;
+  }
+  const near = target.c >= SPEAK_FROM;
+  $('label').textContent = nice(target.cls).toUpperCase();
+  $('sub').textContent = `${side(target.cx).toUpperCase()} · ${near ? 'CLOSE' : 'NEAR'}`;
+  $('bar').style.width = (target.c * 100) + '%';
+  $('bar').style.background = near ? 'var(--red)' : 'var(--amber)';
+}
+
+function draw() {
+  const cw = canvas.clientWidth, ch = canvas.clientHeight, dpr = devicePixelRatio || 1;
+  if (canvas.width !== cw * dpr) { canvas.width = cw * dpr; canvas.height = ch * dpr; }
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, cw, ch);
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return;
+  const s = Math.max(cw / vw, ch / vh), ox = (cw - vw * s) / 2, oy = (ch - vh * s) / 2;  // object-fit: cover
+  for (const p of preds) {
+    const [x, y, w, h] = p.bbox, isT = target && p.bbox === target.bbox;
+    g.strokeStyle = isT ? (target.c >= SPEAK_FROM ? '#ff4d4d' : '#ffb020') : 'rgba(255,255,255,.45)';
+    g.lineWidth = isT ? 4 : 2;
+    g.strokeRect(ox + x * s, oy + y * s, w * s, h * s);
+    g.fillStyle = g.strokeStyle;
+    g.font = '600 15px -apple-system,system-ui';
+    g.fillText(nice(p.class), ox + x * s + 6, oy + y * s + 20);
+  }
+}
+
+// keep the screen on while walking
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && running) keepAwake(); });
+</script>
+</body>
+</html>
