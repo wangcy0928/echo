@@ -51,12 +51,14 @@ video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <script>
 // ---------- settings ----------
-const RELEVANT = new Set(['person','chair','couch','bench','dining table','bicycle','motorcycle','car','bus','truck',
-  'potted plant','bed','toilet','tv','laptop','suitcase','backpack','dog','cat','refrigerator','oven','sink',
-  'fire hydrant','stop sign','umbrella']);
+// all 80 COCO classes count, except small things you won't walk into
+const IGNORE = new Set(['spoon','fork','knife','toothbrush','remote','cell phone','mouse','scissors','book','banana',
+  'apple','orange','carrot','broccoli','hot dog','pizza','donut','cake','sandwich','wine glass','cup','bottle','bowl',
+  'kite','frisbee','sports ball','tie','hair drier','teddy bear','clock','vase','keyboard']);
 const NAMES = {'dining table':'table','potted plant':'plant','tv':'screen','fire hydrant':'hydrant','stop sign':'sign'};
-const BEEP_FROM = 0.30;   // closeness where beeping starts
-const SPEAK_FROM = 0.60;  // closeness where it also speaks
+const BEEP_FROM = 0.45;   // closeness where beeping starts
+const CORRIDOR = 0.6;     // only the middle 60% of the view = your walking path
+const SPEAK_FROM = 0.70;  // closeness where it always beeps and speaks
 const DETECT_MS = 120;
 
 // ---------- elements ----------
@@ -66,7 +68,7 @@ let model, modelPromise, ctx, running = false, muted = false;
 let target = null, lastSeen = 0, lastDetect = 0, preds = [];
 let lastSpeak = 0, lastKey = '', wakeLock = null;
 
-modelPromise = cocoSsd.load({ base: 'lite_mobilenet_v2' });
+modelPromise = cocoSsd.load({ base: 'mobilenet_v2' });
 
 // ---------- start ----------
 $('start').addEventListener('click', async () => {
@@ -110,7 +112,7 @@ async function loop() {
   const now = performance.now();
   if (!muted && now - lastDetect > DETECT_MS && video.readyState >= 2) {
     lastDetect = now;
-    preds = (await model.detect(video, 10, 0.45)).filter(p => RELEVANT.has(p.class));
+    preds = (await model.detect(video, 12, 0.35)).filter(p => !IGNORE.has(p.class));
     pickTarget(now);
   }
   draw();
@@ -120,8 +122,11 @@ async function loop() {
 function pickTarget(now) {
   const vw = video.videoWidth, vh = video.videoHeight;
   let best = null;
+  const L = vw * (1 - CORRIDOR) / 2, R = vw - L;
   for (const p of preds) {
     const [x, y, w, h] = p.bbox;
+    if (x + w < L || x > R) continue;                      // outside your walking path
+    if (y + h < vh * 0.45) continue;                        // high up / far away (signs, ceiling, distant)
     const cx = ((x + w / 2) / vw) * 2 - 1;                 // -1 left … +1 right
     const c = Math.min(1, Math.max(h / vh, Math.sqrt((w * h) / (vw * vh)) * 1.15));
     const score = c * (1 - 0.35 * Math.abs(cx));            // things straight ahead matter more
@@ -131,7 +136,10 @@ function pickTarget(now) {
     if (target && target.cls === best.cls) {                // smooth so it doesn't jitter
       best.c = target.c * 0.55 + best.c * 0.45;
       best.cx = target.cx * 0.55 + best.cx * 0.45;
-    }
+      best.since = target.since; best.hist = target.hist;
+    } else { best.since = now; best.hist = []; }
+    best.hist.push([now, best.c]);
+    while (best.hist.length && now - best.hist[0][0] > 1200) best.hist.shift();
     target = best; target.side = stableSide(best.cx); lastSeen = now;
   } else if (now - lastSeen > 600) {
     target = null;
@@ -177,10 +185,21 @@ function beep(where) {
   }
 }
 
+// Silence when nothing changes: beep for a newly seen object, while you walk toward it,
+// or whenever it is very close. A chair you're standing still next to goes quiet.
+function shouldBeep() {
+  if (!target || target.c < BEEP_FROM) return false;
+  if (target.c >= SPEAK_FROM) return true;
+  const now = performance.now();
+  if (now - target.since < 1500) return true;
+  const first = target.hist[0];
+  return first && target.c - first[1] > 0.04;              // getting closer
+}
+
 function tick() {
   if (!running) return;
   let wait = 300;
-  if (!muted && target && target.c >= BEEP_FROM) {
+  if (!muted && shouldBeep()) {
     beep(target.side);
     wait = 1000 - ((Math.min(target.c, 1) - BEEP_FROM) / (1 - BEEP_FROM)) * 880;  // 1000ms → 120ms
   }
@@ -240,6 +259,9 @@ function draw() {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (!vw) return;
   const s = Math.max(cw / vw, ch / vh), ox = (cw - vw * s) / 2, oy = (ch - vh * s) / 2;  // object-fit: cover
+  const Lx = ox + vw * (1 - CORRIDOR) / 2 * s, Rx = ox + vw * (1 + CORRIDOR) / 2 * s;
+  g.fillStyle = 'rgba(0,0,0,.35)';
+  g.fillRect(0, 0, Lx, ch); g.fillRect(Rx, 0, cw - Rx, ch);       // dim outside the walking path
   for (const p of preds) {
     const [x, y, w, h] = p.bbox, isT = target && p.bbox === target.bbox;
     g.strokeStyle = isT ? (target.c >= SPEAK_FROM ? '#ff4d4d' : '#ffb020') : 'rgba(255,255,255,.45)';
